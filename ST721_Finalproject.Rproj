@@ -11,3 +11,1247 @@ Encoding: UTF-8
 
 RnwWeave: Sweave
 LaTeX: pdfLaTeX
+
+
+
+
+
+
+#1. Creating the bbj_bmi.txt from the autosomes file.
+#Aim: This part converts the Biobank Japan autosomes GWAS file into a clean BMI summary file with standard columns so that we can align it to the HM3 map, build the non EUR PRS and combine with the EUR data for the IVW meta analysis.
+```{r}
+
+
+library(data.table)
+
+infile <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/Ch10_Dataset/data_chapter10/data_chapter10/New folder/GWASsummary_BMI_Japanese_SakaueKanai2020.auto.txt"
+outdir <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/Ch10_Dataset/data_chapter10/data_chapter10"
+
+bbj <- fread(infile)          # reads big .txt directly
+pcol <- if ("P_BOLT_LMM_INF" %in% names(bbj)) "P_BOLT_LMM_INF" else "P_LINREG"
+
+bbj_std <- data.table(
+  SNP  = bbj$SNP,
+  CHR  = as.integer(bbj$CHR),
+  BP   = as.integer(bbj$BP),
+  A1   = toupper(bbj$ALLELE1),            # effect allele
+  A2   = toupper(bbj$ALLELE0),            # other allele
+  BETA = as.numeric(bbj$BETA),
+  SE   = as.numeric(bbj$SE),
+  P    = as.numeric(bbj[[pcol]]),
+  N    = as.integer(NA)                 
+)[complete.cases(SNP, CHR, BP, A1, A2, BETA, SE, P)]
+
+fwrite(bbj_std, file.path(outdir, "bbj_bmi.txt"), sep="\t")   # ← overwrites
+
+# verifying 
+cat("rows:", nrow(bbj_std), "\n")
+print(fread(file.path(outdir, "bbj_bmi.txt"), nrows=5))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+#Read PCA eigenvec and save as pca.txt
+#Aim; This part reads the PCA eigenvec file and saves it as pca.txt so we can add the top ten principal components to each person and use them as covariates to control population structure in every model.
+```{r}
+
+library(data.table)
+path <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/Ch10_Dataset/data_chapter10/data_chapter10"
+
+# read as-is
+pcs <- fread(file.path(path, "pca.eigenvec"), header = FALSE)
+setnames(pcs, c("FID","IID", paste0("PC", seq_len(ncol(pcs)-2))))
+
+# write a .txt copy
+fwrite(pcs, file.path(path, "pca.txt"), sep = "\t")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+#Making the bmi_eur_clean.txt from BMI.txt and the HM3 map
+#Aim; This part reads the European BMI summary file, adds chromosome and base pair from the HM3 map, drops strand ambiguous sites and flips signs to match alleles, then saves a clean table called bmi_eur_clean.txt that lines up with our target genotypes.
+```{r}
+
+library(bigsnpr); library(data.table)
+
+path <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/Ch10_Dataset/data_chapter10/data_chapter10"
+
+# 0) Target map 
+obj <- snp_attach(file.path(path, "1kg_hm3_qc.rds"))
+map <- as.data.table(obj$map)[, .(
+  SNP = marker.ID,
+  CHR = as.integer(chromosome),
+  BP  = as.integer(physical.pos)
+)]
+
+# 1) read EUR BMI (MarkerName, A1, A2, Beta, Pval)
+eur_raw <- fread(file.path(path, "BMI.txt"))
+setnames(eur_raw, c("MarkerName","A1","A2","Beta","Pval"),
+                    c("SNP","A1","A2","BETA","P"))
+
+# 2) SE from Beta and two-sided P
+eur_raw[, Z  := sign(BETA) * qnorm(P/2, lower.tail = FALSE)]
+eur_raw[, SE := abs(BETA) / pmax(abs(Z), 1e-300)]
+
+# 3) Adding CHR/BP from target map
+eur <- merge(
+  eur_raw[, .(SNP, A1 = toupper(A1), A2 = toupper(A2), BETA, SE, P)],
+  map, by = "SNP", all.x = TRUE
+)
+
+# 4) standard 9 cols
+eur <- eur[!is.na(CHR) & !is.na(BP)
+ ][, .(SNP, CHR, BP, A1, A2, BETA, SE, P, N = as.integer(NA))]
+
+fwrite(eur, file.path(path, "bmi_eur_clean.txt"), sep = "\t")
+eur[1:5]
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Standardizing BBJ BMI GWAS and build inverse variance meta with EUR
+#Aim: Here I clean the Japanese BMI summary data into bbj_bmi.txt, then joins it with the cleaned European file on shared rsIDs and computes inverse variance fixed effect betas with standard errors and p values to make bmi_ivw.txt for a combined set of SNP weights.
+```{r}
+
+
+library(data.table)
+infile <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/Ch10_Dataset/data_chapter10/data_chapter10/New folder/GWASsummary_BMI_Japanese_SakaueKanai2020.auto.txt"
+outdir <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/Ch10_Dataset/data_chapter10/data_chapter10"
+
+bbj <- fread(infile)
+pcol <- if ("P_BOLT_LMM_INF" %in% names(bbj)) "P_BOLT_LMM_INF" else "P_LINREG"
+bbj_std <- data.table(
+  SNP  = bbj$SNP,
+  CHR  = as.integer(bbj$CHR),
+  BP   = as.integer(bbj$BP),
+  A1   = toupper(bbj$ALLELE1),
+  A2   = toupper(bbj$ALLELE0),
+  BETA = as.numeric(bbj$BETA),
+  SE   = as.numeric(bbj$SE),
+  P    = as.numeric(bbj[[pcol]]),
+  N    = as.integer(NA)
+)[complete.cases(SNP, CHR, BP, A1, A2, BETA, SE, P)]
+fwrite(bbj_std, file.path(outdir, "bbj_bmi.txt"), sep="\t")
+
+
+eur <- fread(file.path(outdir, "bmi_eur_clean.txt"))
+bbj <- fread(file.path(outdir, "bbj_bmi.txt"))
+
+m <- merge(eur, bbj, by = "SNP", suffixes = c(".EUR",".BBJ"))
+w1 <- 1/(m$SE.EUR^2); w2 <- 1/(m$SE.BBJ^2)
+m$BETA <- (m$BETA.EUR*w1 + m$BETA.BBJ*w2)/(w1+w2)
+m$SE   <- sqrt(1/(w1+w2))
+m$P    <- 2*pnorm(-abs(m$BETA/m$SE))
+m$CHR  <- m$CHR.EUR; m$BP <- m$BP.EUR; m$A1 <- m$A1.EUR; m$A2 <- m$A2.EUR; m$N <- as.integer(NA)
+
+ivw <- m[, .(SNP, CHR, BP, A1, A2, BETA, SE, P, N)]
+fwrite(ivw, file.path(outdir, "bmi_ivw.txt"), sep="\t")
+
+
+```
+
+
+
+
+
+#1. Conduct empirical analysis of PRS.
+
+# Aim: As for this part, we builds and tests the polygenic scores: it matches the summary stats to the target, makes C plus T and LDpred2 scores, standardizes them, fits BMI on each score with PCs, uses a train and test split and reports R2 and some checks.
+
+```{r}
+
+
+library(data.table)
+library(bigsnpr); library(bigstatsr)
+
+pth <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/ST721_Project_Files"
+
+# Genotypes + map/fam
+obj <- snp_attach(file.path(pth, "1kg_hm3_qc.rds"))
+G   <- obj$genotypes
+map <- obj$map
+fam <- obj$fam
+setnames(fam, c("family.ID","sample.ID"), c("FID","IID"))
+
+# Phenotype + PCs
+pheno <- fread(file.path(pth, "BMI_pheno.txt"), fill=TRUE)[, 1:3]
+setnames(pheno, c("FID","IID","BMI"))
+pcs   <- fread(file.path(pth, "pca_eigenvec.txt"))
+D <- merge(as.data.table(fam)[,.(FID,IID)], pheno, by=c("FID","IID"))
+D <- merge(D, pcs, by=c("FID","IID"))
+D$BMI <- as.numeric(D$BMI)
+ind.keep <- match(D$IID, fam$IID)
+
+# Base GWAS (standardize)
+ss <- fread(file.path(pth, "bmi_eur_clean.txt"))
+setnames(ss, c("SNP","CHR","BP","A1","A2","BETA","SE","P"),
+             c("rsid","chr","pos","a1","a0","beta","beta_se","p"))
+ss <- ss[!is.na(beta) & !is.na(p)]
+ss[, `:=`(a1=toupper(a1), a0=toupper(a0))]
+
+# Map with SNP->column index
+map_ref <- data.frame(
+  rsid    = map$marker.ID,
+  chr_ref = map$chromosome,
+  pos_ref = map$physical.pos,
+  a1_ref  = toupper(map$allele1),
+  a0_ref  = toupper(map$allele2),
+  col_idx = seq_len(ncol(G))
+)
+
+# Drop palindromic and harmonize
+pal <- (ss$a1=="A"&ss$a0=="T")|(ss$a1=="T"&ss$a0=="A")|(ss$a1=="C"&ss$a0=="G")|(ss$a1=="G"&ss$a0=="C")
+m <- merge(ss[!pal], map_ref, by="rsid")
+flip  <- (m$a1==m$a0_ref) & (m$a0==m$a1_ref)
+keep  <- flip | ((m$a1==m$a1_ref) & (m$a0==m$a0_ref))
+m     <- m[keep]
+m$beta[flip] <- -m$beta[flip]
+m$col <- m$col_idx
+
+# Clumping
+S_full <- rep(NA_real_, ncol(G))
+S_full[m$col] <- abs(-log10(m$p) * sign(m$beta))
+ind.clump <- snp_clumping(G,
+  ind.row   = ind.keep,
+  infos.chr = map$chromosome,
+  infos.pos = map$physical.pos,
+  S = S_full, thr.r2 = 0.1, size = 250/1000
+)
+
+# PRS grid (full-sample) + evaluation
+pthr <- c(5e-8,1e-6,1e-4,1e-3,1e-2,5e-2,1e-1,5e-1,1)
+best_r2 <- -Inf; best_prs <- NULL
+for (t in pthr) {
+  cols <- intersect(ind.clump, m$col[m$p <= t]); cols <- cols[!is.na(cols)]
+  if (!length(cols)) next
+  w <- m$beta[match(cols, m$col)]
+  prs <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols,
+                     center=rep(0, length(cols)), scale=rep(1, length(cols)))
+  r2  <- summary(lm(BMI ~ prs + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+  if (r2 > best_r2) { best_r2 <- r2; best_prs <- prs }
+}
+D$PRS_CT <- best_prs
+mod_base <- lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D)
+mod_full <- lm(BMI ~ PRS_CT + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D)
+r2_base <- summary(mod_base)$r.squared
+r2_full <- summary(mod_full)$r.squared
+cat("R2_full =", round(r2_full,4), " | ΔR2 =", round(r2_full - r2_base,4), "\n")
+print(anova(mod_base, mod_full))
+print(summary(mod_full)$coef["PRS_CT", ])
+
+# I used 80/20 holdout: Here I tune on train and evaluate on test
+set.seed(1)
+n <- nrow(D)
+idx_tr <- sample.int(n, floor(0.8*n))
+idx_te <- setdiff(seq_len(n), idx_tr)
+
+best_tr <- -Inf; best_cols <- NULL; best_w <- NULL
+for (t in pthr) {
+  cols <- intersect(ind.clump, m$col[m$p <= t]); cols <- cols[!is.na(cols)]
+  if (!length(cols)) next
+  w <- m$beta[match(cols, m$col)]
+  prs_tr <- big_prodVec(G, w, ind.row=ind.keep[idx_tr], ind.col=cols,
+                        center=rep(0, length(cols)), scale=rep(1, length(cols)))
+  r2_tr  <- summary(lm(BMI ~ prs_tr + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D[idx_tr,]))$r.squared
+  if (r2_tr > best_tr) { best_tr <- r2_tr; best_cols <- cols; best_w <- w }
+}
+
+prs_te <- big_prodVec(G, best_w, ind.row=ind.keep[idx_te], ind.col=best_cols,
+                      center=rep(0, length(best_cols)), scale=rep(1, length(best_cols)))
+r2_base_te <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D[idx_te,]))$r.squared
+r2_full_te <- summary(lm(BMI ~ prs_te + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D[idx_te,]))$r.squared
+cat("Test R2 =", round(r2_full_te,4), " | Test ΔR2 =", round(r2_full_te - r2_base_te,4), "\n")
+
+
+
+# ===== I included some diagnostics =====
+
+# 1) Standardized PRS effect
+D$PRSz <- as.numeric(scale(D$PRS_CT))
+mod_std <- lm(BMI ~ PRSz + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D)
+print(summary(mod_std)$coef["PRSz", ])   # estimate, SE, t, p
+
+# 2) Partial R^2 of PRS (beyond PCs)
+pR2 <- (r2_full - r2_base) / (1 - r2_base)
+cat("Partial R2 (PRS | PCs) =", round(pR2, 4), "\n")
+
+# 3) Correlation of PRS with PCs
+cors <- sapply(paste0("PC",1:10), function(pc) cor(D$PRSz, D[[pc]], use="complete.obs"))
+print(round(cors, 3))
+
+# 4) Decile gradient (mean BMI by PRS decile)
+qs <- quantile(D$PRSz, seq(0,1,0.1), na.rm=TRUE)
+D$decile <- cut(D$PRSz, qs, include.lowest=TRUE, labels=paste0("D",1:10))
+print(tapply(D$BMI, D$decile, mean))
+
+# 5) EUR-only robustness using 1kg_samples.txt
+samples <- data.table::fread(file.path(pth, "1kg_samples.txt"))
+data.table::setnames(samples, c("Sample name","Superpopulation code"), c("IID","SUPER"))
+D_eur <- merge(D, samples[,.(IID,SUPER)], by="IID", all.x=TRUE)
+idxE  <- which(D_eur$SUPER == "EUR")
+
+if (length(idxE) > 20) {
+  mbE <- lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D_eur[idxE,])
+  mfE <- lm(BMI ~ PRSz + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D_eur[idxE,])
+  r2bE <- summary(mbE)$r.squared
+  r2fE <- summary(mfE)$r.squared
+  cat("EUR-only: R2_full =", round(r2fE,4), " | ΔR2 =", round(r2fE - r2bE,4), "\n")
+}
+
+
+
+
+
+
+library(ggplot2)
+
+# standardize once
+D$PRSz <- as.numeric(scale(D$PRS_CT))
+
+# 1) Tuning curve: ΔR² vs p-threshold 
+r2_grid <- sapply(pthr, function(t) {
+  cols <- intersect(ind.clump, m$col[m$p <= t]); cols <- cols[!is.na(cols)]
+  if (!length(cols)) return(NA_real_)
+  w <- m$beta[match(cols, m$col)]
+  s <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols, center=rep(0,length(cols)), scale=rep(1,length(cols)))
+  r2b <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+  r2f <- summary(lm(BMI ~ s + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+  r2f - r2b
+})
+df_tune <- data.frame(pthr = pthr, dR2 = r2_grid)
+ggplot(df_tune, aes(pthr, dR2)) +
+  geom_line() + geom_point() + scale_x_log10() +
+  labs(title = "C+T tuning curve", x = "p-threshold (log10)", y = "ΔR² vs PCs") +
+  theme_bw()
+
+# 2) BMI ~ PRS (scatter + linear smooth)
+ggplot(D, aes(PRSz, BMI)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "BMI vs standardized PRS (C+T)", x = "PRS z-score", y = "BMI") +
+  theme_bw()
+
+# 3) Mean BMI by PRS decile (risk gradient for continuous trait)
+qs <- quantile(D$PRSz, seq(0,1,0.1), na.rm = TRUE)
+D$decile <- cut(D$PRSz, qs, include.lowest = TRUE, labels = paste0("D", 1:10))
+mu <- aggregate(BMI ~ decile, D, mean)
+ggplot(mu, aes(decile, BMI)) +
+  geom_col(width = 0.7) +
+  labs(title = "Mean BMI by PRS decile (C+T)", x = "PRS decile", y = "Mean BMI") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 4) PRS density by case status (obesity_pheno.txt): I only included but not required for our project
+ob <- data.table::fread(file.path(pth, "obesity_pheno.txt"), col.names = c("FID","IID","case"))
+D2 <- merge(D, ob, by = c("FID","IID"), all.x = TRUE)
+ggplot(D2[!is.na(case),], aes(PRSz, fill = factor(case))) +
+geom_density(alpha = 0.4) +
+scale_fill_discrete(name = "Case", labels = c("Control","Case")) +
+labs(title = "PRS distribution by case status (C+T)", x = "PRS z-score", y = "Density") +
+theme_bw()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Creating and saving the HM3 SNP map for PRS work ((chr rsid pos alleles))
+#Aim: This part I make map of HM3 SNPs from the target data with chr, rsid, pos, and alleles and saves it so that in the later steps I can match and align summary stats to the same SNPs.
+```{r}
+
+library(bigsnpr)
+library(data.table)
+
+pth <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/ST721_Project_Files"
+obj <- snp_attach(file.path(pth, "1kg_hm3_qc.rds"))
+
+map_std <- data.frame(
+  chr  = obj$map$chromosome,
+  rsid = obj$map$marker.ID,
+  pos  = obj$map$physical.pos,
+  a1   = obj$map$allele1,
+  a0   = obj$map$allele2
+)
+
+fwrite(map_std, file.path(pth, "hm3_map_for_prs.txt"), sep = "\t")
+
+```
+
+
+
+
+
+
+
+
+
+
+#2: Build 3 sets of PRS for BMI using different SNP weights: (a) Weights derived from EUR GWAS; (b) weights derived from the non-EUR GWAS; (c) weights derived from the inverse-variance-weighted (IVW) meta-analysis estimates combining EUR and non-EUR GWAS summary statistics.
+
+#Aim: Here we makes three PRS for BMI using weights from Europe, from Biobank Japan and from an inverse variance weighted meta of the two, so that we can see which one predicts best in the test set and how well they work across ancestry groups.
+```{r}
+
+
+
+library(data.table)
+library(bigsnpr); library(bigstatsr)
+
+pth <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/ST721_Project_Files"
+
+# ---------- target data ----------
+obj <- snp_attach(file.path(pth, "1kg_hm3_qc.rds"))
+G   <- obj$genotypes
+map <- obj$map
+fam <- obj$fam
+data.table::setnames(fam, c("family.ID","sample.ID"), c("FID","IID"))
+
+pheno <- fread(file.path(pth, "BMI_pheno.txt"), fill=TRUE)[, 1:3]
+setnames(pheno, c("FID","IID","BMI"))
+pcs   <- fread(file.path(pth, "pca_eigenvec.txt"))
+D <- merge(as.data.table(fam)[,.(FID,IID)], pheno, by=c("FID","IID"))
+D <- merge(D, pcs, by=c("FID","IID"))
+D$BMI <- as.numeric(D$BMI)
+ind.keep <- match(D$IID, fam$IID)
+
+# Referencing map to align alleles and get column indices
+map_ref <- data.frame(
+  rsid    = map$marker.ID,
+  chr_ref = map$chromosome,
+  pos_ref = map$physical.pos,
+  a1_ref  = toupper(map$allele1),
+  a0_ref  = toupper(map$allele2),
+  col_idx = seq_len(ncol(G))
+)
+
+# ---------- helpers ----------
+std_gwas <- function(x, drop_nonrs=FALSE) {
+  nm <- names(x)
+  # unifying common header variants
+  repl <- c(SNP="rsid", MarkerName="rsid",
+            CHR="chr", BP="pos", A1="a1", A2="a0",
+            BETA="beta", SE="beta_se", P="p",
+            N="n_eff")
+  for (k in names(repl)) if (k %in% nm) setnames(x, k, repl[[k]])
+  #We will  keep required cols
+  keep <- intersect(c("rsid","chr","pos","a1","a0","beta","beta_se","p","n_eff"), names(x))
+  x <- x[, ..keep]
+  x[, `:=`(a1=toupper(a1), a0=toupper(a0))]
+  if (drop_nonrs) x <- x[grepl("^rs", rsid)]
+  x[!is.na(beta) & !is.na(p)]
+}
+
+harmonize_to_map <- function(ss, map_ref) {
+  # drop palindromic
+  pal <- (ss$a1=="A"&ss$a0=="T")|(ss$a1=="T"&ss$a0=="A")|(ss$a1=="C"&ss$a0=="G")|(ss$a1=="G"&ss$a0=="C")
+  ss <- ss[!pal]
+  m  <- merge(ss, map_ref, by="rsid")
+  flip  <- (m$a1==m$a0_ref) & (m$a0==m$a1_ref)
+  keep  <- flip | ((m$a1==m$a1_ref) & (m$a0==m$a0_ref))
+  m     <- m[keep]
+  m$beta[flip]    <- -m$beta[flip]
+  if ("beta_se" %in% names(m)) m$beta_se <- m$beta_se # keep if present
+  m$col <- m$col_idx
+  m
+}
+
+build_prs_ct <- function(m, tag) {
+  S_full <- rep(NA_real_, ncol(G))
+  S_full[m$col] <- abs(-log10(m$p) * sign(m$beta))
+  ind.clump <- snp_clumping(G,
+    ind.row = ind.keep,
+    infos.chr = map$chromosome,
+    infos.pos = map$physical.pos,
+    S = S_full, thr.r2 = 0.1, size = 250/1000
+  )
+  pthr <- c(5e-8,1e-6,1e-4,1e-3,1e-2,5e-2,1e-1,5e-1,1)
+  best <- -Inf; best_prs <- NULL
+  for (t in pthr) {
+    cols <- intersect(ind.clump, m$col[m$p <= t]); cols <- cols[!is.na(cols)]
+    if (!length(cols)) next
+    w <- m$beta[match(cols, m$col)]
+    prs <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols,
+                       center=rep(0, length(cols)), scale=rep(1, length(cols)))
+    r2  <- summary(lm(BMI ~ prs + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+    if (r2 > best) { best <- r2; best_prs <- prs }
+  }
+  list(prs = best_prs, r2 = best)
+}
+
+report_r2 <- function(scores, label) {
+  mb <- lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D)
+  mf <- lm(BMI ~ scores + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D)
+  r2b <- summary(mb)$r.squared; r2f <- summary(mf)$r.squared
+  cat(label, "R2_full =", round(r2f,4), "| ΔR2 =", round(r2f - r2b,4), "\n")
+}
+
+# ---------- EUR PRS ----------
+ss_eur <- std_gwas(fread(file.path(pth, "bmi_eur_clean.txt")))
+m_eur  <- harmonize_to_map(ss_eur, map_ref)
+res_eur <- build_prs_ct(m_eur, "EUR")
+D$PRS_EUR <- res_eur$prs
+report_r2(D$PRS_EUR, "[EUR]")
+
+# ---------- BBJ (non-EUR) PRS ----------
+ss_bbj <- std_gwas(fread(file.path(pth, "bbj_bmi.txt")), drop_nonrs=TRUE)
+m_bbj  <- harmonize_to_map(ss_bbj, map_ref)
+res_bbj <- build_prs_ct(m_bbj, "BBJ")
+D$PRS_BBJ <- res_bbj$prs
+report_r2(D$PRS_BBJ, "[BBJ]")
+
+# ---------- IVW meta PRS ----------
+if (file.exists(file.path(pth, "bmi_ivw.txt"))) {
+  ss_ivw <- std_gwas(fread(file.path(pth, "bmi_ivw.txt")))
+} else {
+  # Let us compute IVW meta from EUR + BBJ 
+  a <- m_eur[, .(rsid, beta_eur=beta, se_eur=beta_se)]
+  b <- m_bbj[, .(rsid, beta_bbj=beta, se_bbj=beta_se)]
+  ab <- merge(a, b, by="rsid")
+  ab <- ab[!is.na(se_eur) & !is.na(se_bbj) & se_eur>0 & se_bbj>0]
+  w1 <- 1/ab$se_eur^2; w2 <- 1/ab$se_bbj^2; wsum <- w1 + w2
+  beta_meta <- (w1*ab$beta_eur + w2*ab$beta_bbj) / wsum
+  se_meta   <- sqrt(1/wsum)
+  z <- beta_meta / se_meta
+  p <- 2*pnorm(-abs(z))
+  ss_ivw <- data.table(rsid=ab$rsid, chr=NA_integer_, pos=NA_integer_,
+                       a1=NA_character_, a0=NA_character_,
+                       beta=beta_meta, beta_se=se_meta, p=p)
+}
+m_ivw   <- harmonize_to_map(ss_ivw, map_ref)
+res_ivw <- build_prs_ct(m_ivw, "IVW")
+D$PRS_IVW <- res_ivw$prs
+report_r2(D$PRS_IVW, "[IVW]")
+
+
+
+samples <- data.table::fread(file.path(pth, "1kg_samples.txt"))
+data.table::setnames(samples, c("Sample name","Superpopulation code"), c("IID","SUPER"))
+DE <- merge(D, samples[,.(IID,SUPER)], by="IID", all.x=TRUE)
+ix <- which(DE$SUPER=="EUR")
+
+base_E <- lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=DE[ix,])
+r2bE <- summary(base_E)$r.squared
+for (nm in c("PRS_EUR","PRS_BBJ","PRS_IVW")) {
+  r2fE <- summary(lm(reformulate(c(nm, paste0("PC",1:10)), "BMI"), data=DE[ix,]))$r.squared
+  cat(nm, "EUR-only ΔR2 =", round(r2fE - r2bE, 4), "\n")
+}
+
+
+
+
+set.seed(7)
+n <- nrow(D)
+itr <- sample.int(n, floor(0.8*n))
+ite <- setdiff(seq_len(n), itr)
+
+base_te <- lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D[ite,])
+r2b_te <- summary(base_te)$r.squared
+
+fit_stk <- lm(BMI ~ PRS_EUR + PRS_BBJ + PRS_IVW + 
+                PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D[itr,])
+pred_te <- predict(fit_stk, newdata=D[ite,])
+r2f_te <- 1 - sum((D$BMI[ite]-pred_te)^2)/sum((D$BMI[ite]-mean(D$BMI[ite]))^2)
+cat("Stack Test ΔR2 =", round(r2f_te - r2b_te, 4), "\n")
+print(coef(fit_stk)[c("PRS_EUR","PRS_BBJ","PRS_IVW")])
+
+
+
+
+
+
+
+
+
+library(ggplot2); library(pROC); library(data.table)
+
+# standardize PRS
+D$PRS_EUR_z <- as.numeric(scale(D$PRS_EUR))
+D$PRS_BBJ_z <- as.numeric(scale(D$PRS_BBJ))
+D$PRS_IVW_z <- as.numeric(scale(D$PRS_IVW))
+
+# -------- 1) Tuning curves (full-sample ΔR2 vs p-threshold) --------
+r2b_all <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+tune_curve <- function(m) {
+  sapply(pthr, function(t) {
+    cols <- intersect(ind.clump, m$col[m$p <= t]); cols <- cols[!is.na(cols)]
+    if (!length(cols)) return(NA_real_)
+    w <- m$beta[match(cols, m$col)]
+    s <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols, center=rep(0, length(cols)), scale=rep(1, length(cols)))
+    r2f <- summary(lm(BMI ~ s + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+    r2f - r2b_all
+  })
+}
+df_tune <- rbind(
+  data.frame(Method="EUR", pthr=pthr, dR2=tune_curve(m_eur)),
+  data.frame(Method="BBJ", pthr=pthr, dR2=tune_curve(m_bbj)),
+  data.frame(Method="IVW", pthr=pthr, dR2=tune_curve(m_ivw))
+)
+ggplot(df_tune, aes(pthr, dR2, color=Method)) +
+  geom_line() + geom_point() + scale_x_log10() +
+  labs(title="C+T tuning curves", x="p-threshold (log10)", y="ΔR² vs PCs") +
+  theme_bw()
+
+# -------- 2) Test-set ΔR2 bars (reusing my itr/ite split) --------
+score_test <- function(s) {
+  df_tr <- D[itr,]; df_te <- D[ite,]
+  f  <- lm(BMI ~ s + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=data.frame(df_tr, s=s[itr]))
+  pr <- predict(f, newdata=data.frame(df_te, s=s[ite]))
+  r2b<- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=df_te))$r.squared
+  r2f<- 1 - sum((df_te$BMI - pr)^2)/sum((df_te$BMI - mean(df_te$BMI))^2)
+  r2f - r2b
+}
+df_bar <- data.frame(
+  Method=c("EUR","BBJ","IVW"),
+  dR2=c(score_test(D$PRS_EUR), score_test(D$PRS_BBJ), score_test(D$PRS_IVW))
+)
+ggplot(df_bar, aes(Method, dR2, fill=Method)) +
+  geom_col(width=.6, show.legend=FALSE) +
+  geom_text(aes(label=sprintf("%.3f", dR2)), vjust=-.25) +
+  labs(title="Test ΔR² by PRS source", y="ΔR² (vs PCs only)", x="") +
+  theme_bw()
+
+# -------- 3) BMI vs PRS (scatter + linear fit) --------
+df_sc <- rbind(
+  data.frame(Method="EUR", PRS=D$PRS_EUR_z, BMI=D$BMI),
+  data.frame(Method="BBJ", PRS=D$PRS_BBJ_z, BMI=D$BMI),
+  data.frame(Method="IVW", PRS=D$PRS_IVW_z, BMI=D$BMI)
+)
+ggplot(df_sc, aes(PRS, BMI)) +
+  geom_point(alpha=.3, size=1) +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~Method) +
+  labs(title="BMI vs standardized PRS", x="PRS z-score", y="BMI") +
+  theme_bw()
+
+
+
+
+
+# -------- 4) Prevalence by PRS decile  --------
+phfile <- if (file.exists(file.path(pth,"obesity_pheno.txt"))) "obesity_pheno.txt" else "Obesity_pheno.txt"
+if (file.exists(file.path(pth, phfile))) {
+  ob <- fread(file.path(pth, phfile), col.names=c("FID","IID","case"))
+  D2 <- merge(D, ob, by=c("FID","IID"), all.x=TRUE)
+  prev_dec <- function(scores, name) {
+    te <- D2[!is.na(case), ]
+    q  <- quantile(scores, probs=seq(0,1,.1), na.rm=TRUE)
+    d  <- cut(scores, q, include.lowest=TRUE, labels=paste0("D",1:10))
+    dd <- data.table(Decile=d, case=te$case)[, .(n=.N, p=mean(case==1)), by=Decile]
+    dd$Method <- name; dd
+  }
+  prev_all <- rbind(
+    prev_dec(D2$PRS_EUR_z, "EUR"),
+    prev_dec(D2$PRS_BBJ_z, "BBJ"),
+    prev_dec(D2$PRS_IVW_z, "IVW")
+  )
+  ggplot(prev_all, aes(Decile, p, group=Method, color=Method)) +
+    geom_point() + geom_line() +
+    labs(title="Case prevalence across PRS deciles", y="Prevalence of case", x="PRS decile") +
+    theme_bw() + theme(axis.text.x=element_text(angle=45,hjust=1))
+
+  
+  
+  
+  
+  
+  # -------- 5) ROC curves (test-set; fit on TRAIN with PCs) --------
+  TR <- D2[itr,]; TE <- D2[ite,]
+  te_cc <- TE[!is.na(case), ]
+  if (nrow(te_cc)>20 && length(unique(te_cc$case))==2) {
+    pred_prob <- function(prs) {
+      g <- glm(case ~ prs + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10,
+               data=data.frame(TR, prs=TR[[prs]]), family=binomial())
+      predict(g, newdata=data.frame(te_cc, prs=te_cc[[prs]]), type="response")
+    }
+    roc_df <- function(p, y) { r <- pROC::roc(y, p, quiet=TRUE)
+      as.data.frame(pROC::coords(r,"all", ret=c("specificity","sensitivity")))[,2:1] |> setNames(c("TPR","FPR")) |>
+        transform(AUC=as.numeric(pROC::auc(r)))
+    }
+    R <- rbind(
+      cbind(Method="EUR", roc_df(pred_prob("PRS_EUR_z"), te_cc$case)),
+      cbind(Method="BBJ", roc_df(pred_prob("PRS_BBJ_z"), te_cc$case)),
+      cbind(Method="IVW", roc_df(pred_prob("PRS_IVW_z"), te_cc$case))
+    )
+    auc_lab <- aggregate(AUC ~ Method, R, mean)
+    ggplot(R, aes(FPR, TPR, color=Method)) +
+      geom_path(size=1) + geom_abline(slope=1, intercept=0, linetype=2) +
+      labs(title=paste0("ROC (test) — AUC: ",
+                        paste(auc_lab$Method, sprintf("%.3f", auc_lab$AUC), collapse=" | ")),
+           x="False Positive Rate", y="True Positive Rate") +
+      theme_bw()
+  }
+}
+
+
+
+
+# -------- 6) PRS distribution by ancestry  --------
+samples <- fread(file.path(pth, "1kg_samples.txt"))
+setnames(samples, c("Sample name","Superpopulation code"), c("IID","SUPER"))
+D3 <- merge(D, samples[,.(IID,SUPER)], by="IID", all.x=TRUE)
+df_den <- rbind(
+  data.frame(Method="EUR", SUPER=D3$SUPER, PRS=D3$PRS_EUR_z),
+  data.frame(Method="BBJ", SUPER=D3$SUPER, PRS=D3$PRS_BBJ_z),
+  data.frame(Method="IVW", SUPER=D3$SUPER, PRS=D3$PRS_IVW_z)
+)
+ggplot(na.omit(df_den), aes(PRS, after_stat(density), fill=SUPER)) +
+  geom_histogram(bins=40, position="identity", alpha=.35) +
+  facet_wrap(~Method, scales="free_y") +
+  labs(title="PRS distributions by ancestry", x="PRS z-score", y="Density") +
+  theme_bw()
+
+
+
+
+#3: Applying 3 different PRS approaches, including clumping + thresholding (C+T) and a Bayesian method.
+
+
+#Aim: Here we makes PRS with a clumping and threshold method and with a Bayesian method like LDpred2 auto or LDpred2 infinitesimal, so we that can compare simple and model based scores and choose the one that predicts best in the test set.
+```{r}
+
+
+
+library(data.table)
+library(bigsnpr); library(bigstatsr); library(bigsparser); library(ggplot2)
+
+pth <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/ST721_Project_Files"
+
+# target
+obj <- snp_attach(file.path(pth, "1kg_hm3_qc.rds"))
+G   <- obj$genotypes
+map <- obj$map
+fam <- obj$fam
+setnames(fam, c("family.ID","sample.ID"), c("FID","IID"))
+
+pheno <- fread(file.path(pth, "BMI_pheno.txt"), fill=TRUE)[,1:3]
+setnames(pheno, c("FID","IID","BMI"))
+pcs   <- fread(file.path(pth, "pca_eigenvec.txt"))
+D <- merge(as.data.table(fam)[,.(FID,IID)], pheno, by=c("FID","IID"))
+D <- merge(D, pcs, by=c("FID","IID"))
+D$BMI <- as.numeric(D$BMI)
+ind.keep <- match(D$IID, fam$IID)
+
+# EUR GWAS -> standardize -> match
+ss <- fread(file.path(pth, "bmi_eur_clean.txt"))
+setnames(ss, c("SNP","CHR","BP","A1","A2","BETA","SE","P"),
+             c("rsid","chr","pos","a1","a0","beta","beta_se","p"))
+ss <- ss[!is.na(beta) & !is.na(p)]
+ss[, `:=`(a1=toupper(a1), a0=toupper(a0))]
+if (!"N" %in% names(ss)) ss[, n_eff := 200000] else setnames(ss, "N", "n_eff")
+
+map2 <- data.frame(chr=map$chromosome, pos=map$physical.pos,
+                   rsid=map$marker.ID, a0=toupper(map$allele2), a1=toupper(map$allele1))
+info <- snp_match(sumstats=as.data.frame(ss), info_snp=map2)
+
+# ---- C+T
+S <- rep(NA_real_, ncol(G))
+S[info$`_NUM_ID_`] <- abs(-log10(info$p) * sign(info$beta))
+ind.clump <- snp_clumping(G, ind.row=ind.keep, infos.chr=map$chromosome,
+                          infos.pos=map$physical.pos, S=S, thr.r2=0.1, size=250/1000)
+pthr <- c(5e-8,1e-6,1e-4,1e-3,1e-2,5e-2,1e-1,5e-1,1)
+best_r2 <- -Inf; PRS_CT <- NULL
+for (t in pthr) {
+  cols <- intersect(ind.clump, info$`_NUM_ID_`[info$p <= t]); if (!length(cols)) next
+  w <- info$beta[match(cols, info$`_NUM_ID_`)]
+  prs <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols,
+                     center=rep(0, length(cols)), scale=rep(1, length(cols)))
+  r2  <- summary(lm(BMI ~ prs + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+  if (r2 > best_r2) { best_r2 <- r2; PRS_CT <- prs }
+}
+D$PRS_CT <- PRS_CT
+r2b <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+r2f <- summary(lm(BMI ~ PRS_CT + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+cat("[C+T] R2_full =", round(r2f,4), "| ΔR2 =", round(r2f - r2b,4), "\n")
+
+# ---- LDpred2-auto + LDpred2-inf (per-chr, sorted) ----
+beta_auto_all <- rep(0, ncol(G))
+beta_inf_all  <- rep(0, ncol(G))
+cols_all      <- integer(0)
+
+get_h2 <- function(corr, dfb) {
+  x <- snp_ldsc2(corr, dfb)
+  h2 <- if (is.list(x) && !is.null(x$h2)) x$h2 else as.numeric(x)[1]
+  if (!is.finite(h2) || h2 <= 0) h2 <- 0.2
+  h2
+}
+
+get_beta_auto <- function(aobj, L) {
+  if (is.list(aobj) && !is.null(aobj$beta_est)) return(aobj$beta_est)
+  if (is.list(aobj) && length(aobj) && !is.null(aobj[[1]]$beta_est))
+    return(rowMeans(do.call(cbind, lapply(aobj, `[[`, "beta_est")), na.rm=TRUE))
+  if (is.numeric(aobj) && length(aobj)==L) return(aobj)
+  rep(0, L)
+}
+
+for (c in sort(unique(info$chr))) {
+  rows    <- which(info$chr == c)
+  ind.chr <- info$`_NUM_ID_`[rows]
+  ord     <- order(info$pos[rows])
+  rows    <- rows[ord]
+  ind.chr <- ind.chr[ord]
+
+  df_beta <- data.frame(
+    beta    = as.numeric(info$beta[rows]),
+    beta_se = as.numeric(ifelse(is.na(info$beta_se[rows]) | info$beta_se[rows] <= 0, 0.02, info$beta_se[rows])),
+    n_eff   = as.numeric(ifelse(is.na(info$n_eff[rows])   | info$n_eff[rows]   <= 0, 200000, info$n_eff[rows]))
+  )
+
+  corr <- bigsparser::as_SFBM(snp_cor(G, ind.row=ind.keep, ind.col=ind.chr,
+                                      infos.pos=map$physical.pos[ind.chr], size=3/1000))
+
+  h2 <- get_h2(corr, df_beta)
+
+  a <- snp_ldpred2_auto(corr, df_beta, h2_init=h2)
+  beta_auto_chr <- get_beta_auto(a, length(ind.chr))
+  beta_inf_chr  <- snp_ldpred2_inf(corr, df_beta, h2)
+
+  beta_auto_all[ind.chr] <- ifelse(is.na(beta_auto_chr), 0, beta_auto_chr)
+  beta_inf_all[ind.chr]  <- ifelse(is.na(beta_inf_chr),  0, beta_inf_chr)
+  cols_all <- c(cols_all, ind.chr)
+}
+
+cols_all <- unique(cols_all)
+PRS_LDPA <- big_prodVec(G, beta_auto_all[cols_all], ind.row=ind.keep, ind.col=cols_all,
+                        center=rep(0, length(cols_all)), scale=rep(1, length(cols_all)))
+PRS_LDPI <- big_prodVec(G, beta_inf_all[cols_all],  ind.row=ind.keep, ind.col=cols_all,
+                        center=rep(0, length(cols_all)), scale=rep(1, length(cols_all)))
+
+r2a <- summary(lm(BMI ~ PRS_LDPA + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+r2i <- summary(lm(BMI ~ PRS_LDPI + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+cat("[LDpred2-auto] R2_full =", round(r2a,4), "| ΔR2 =", round(r2a - r2b,4), "\n")
+cat("[LDpred2-inf ] R2_full =", round(r2i,4), "| ΔR2 =", round(r2i - r2b,4), "\n")
+
+
+
+
+
+#=========================================================================#
+# Just making sure PRS columns exist inside D
+if (!"PRS_CT"   %in% names(D)) D$PRS_CT   <- PRS_CT
+if (!"PRS_LDPA" %in% names(D)) D$PRS_LDPA <- as.numeric(PRS_LDPA)
+if (!"PRS_LDPI" %in% names(D)) D$PRS_LDPI <- as.numeric(PRS_LDPI)
+
+
+# 80/20 comparison of methods — data.frame 
+set.seed(7)
+n <- nrow(D)
+idx_tr <- sample.int(n, floor(0.8*n))
+idx_te <- setdiff(seq_len(n), idx_tr)
+
+df_tr_base <- as.data.frame(D[idx_tr,])
+df_te_base <- as.data.frame(D[idx_te,])
+
+r2b_te <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10,
+                     data = df_te_base))$r.squared
+
+score <- function(s) {
+  df_tr <- data.frame(df_tr_base, s = as.numeric(s[idx_tr]))
+  df_te <- data.frame(df_te_base, s = as.numeric(s[idx_te]))
+  fit <- lm(BMI ~ s + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data = df_tr)
+  pr  <- predict(fit, newdata = df_te)
+  r2f <- 1 - sum((df_te$BMI - pr)^2) / sum((df_te$BMI - mean(df_te$BMI))^2)
+  r2f - r2b_te
+}
+
+cat("Test ΔR2 C+T  =", round(score(D$PRS_CT),   4), "\n")
+cat("Test ΔR2 Auto =", round(score(D$PRS_LDPA), 4), "\n")
+cat("Test ΔR2 Inf  =", round(score(D$PRS_LDPI), 4), "\n")
+
+# stacking the three PRS
+df_tr <- data.frame(df_tr_base,
+                    s1 = as.numeric(D$PRS_CT[idx_tr]),
+                    s2 = as.numeric(D$PRS_LDPA[idx_tr]),
+                    s3 = as.numeric(D$PRS_LDPI[idx_tr]))
+df_te <- data.frame(df_te_base,
+                    s1 = as.numeric(D$PRS_CT[idx_te]),
+                    s2 = as.numeric(D$PRS_LDPA[idx_te]),
+                    s3 = as.numeric(D$PRS_LDPI[idx_te]))
+stk <- lm(BMI ~ s1 + s2 + s3 +
+            PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data = df_tr)
+pr  <- predict(stk, newdata = df_te)
+r2f_stk <- 1 - sum((df_te$BMI - pr)^2) / sum((df_te$BMI - mean(df_te$BMI))^2)
+cat("Stack Test ΔR2 =", round(r2f_stk - r2b_te, 4), "\n")
+print(coef(stk)[c("s1","s2","s3")])
+
+
+
+
+
+
+
+
+
+# ROC for obesity 
+ob <- data.table::fread(file.path(pth, "obesity_pheno.txt"), col.names = c("FID","IID","case"))
+D2 <- merge(D, ob, by = c("FID","IID"), all.x = TRUE)
+if (sum(!is.na(D2$case)) > 20 && length(unique(na.omit(D2$case))) == 2) {
+tr <- sample.int(nrow(D2), floor(0.8*nrow(D2)))
+g  <- glm(case ~ PRSz + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10,
+            data = D2[tr,], family = binomial())
+p  <- predict(g, newdata = D2[-tr,], type = "response")
+r  <- pROC::roc(D2$case[-tr], p, quiet = TRUE)
+   plot(r, main = sprintf("ROC (AUC = %.3f)", pROC::auc(r)))
+ }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#4: Evaluating predictive performance: standardize the PRS and evaluate the prediction accuracy in the target testing set using metrics such as R2 , AUC, and the odds ratios of the disease across PRS percentiles etc. Compare and discuss results across different ancestries and PRS methods.
+
+
+#Aim: We check how well the scores work by scaling each PRS, and we also test on the held out set, report R2 for BMI and AUC and odds ratios across PRS percentiles when case labels exist and then compare results across ancestry groups and across methods to see what works best.
+```{r}
+
+
+# --- Here I have to rebuild D and three PRS (C+T, LDpred2-auto, LDpred2-inf) ---
+library(data.table)
+library(bigsnpr); library(bigstatsr); library(bigsparser)
+
+pth <- "C:/Users/tboakye/Desktop/FALL 2025/ST 721/GROUP PROJECT/ST721_Project_Files"
+
+# target + covars
+obj <- snp_attach(file.path(pth, "1kg_hm3_qc.rds"))
+G   <- obj$genotypes; map <- obj$map; fam <- obj$fam
+setnames(fam, c("family.ID","sample.ID"), c("FID","IID"))
+pheno <- fread(file.path(pth, "BMI_pheno.txt"), fill=TRUE)[,1:3]
+setnames(pheno, c("FID","IID","BMI"))
+pcs   <- fread(file.path(pth, "pca_eigenvec.txt"))
+D <- merge(as.data.table(fam)[,.(FID,IID)], pheno, by=c("FID","IID"))
+D <- merge(D, pcs, by=c("FID","IID")); D$BMI <- as.numeric(D$BMI)
+ind.keep <- match(D$IID, fam$IID)
+
+# EUR GWAS -> match to HM3
+ss <- fread(file.path(pth, "bmi_eur_clean.txt"))
+setnames(ss, c("SNP","CHR","BP","A1","A2","BETA","SE","P"),
+             c("rsid","chr","pos","a1","a0","beta","beta_se","p"))
+ss <- ss[!is.na(beta) & !is.na(p)][, `:=`(a1=toupper(a1), a0=toupper(a0))]
+if (!"N" %in% names(ss)) ss[, n_eff := 200000] else setnames(ss, "N", "n_eff")
+map2 <- data.frame(chr=map$chromosome, pos=map$physical.pos,
+                   rsid=map$marker.ID, a0=toupper(map$allele2), a1=toupper(map$allele1))
+info <- snp_match(sumstats=as.data.frame(ss), info_snp=map2)
+
+# ---------- C+T ----------
+S <- rep(NA_real_, ncol(G))
+S[info$`_NUM_ID_`] <- abs(-log10(info$p) * sign(info$beta))
+ind.clump <- snp_clumping(G, ind.row=ind.keep, infos.chr=map$chromosome,
+                          infos.pos=map$physical.pos, S=S, thr.r2=0.1, size=250/1000)
+pthr <- c(5e-8,1e-6,1e-4,1e-3,1e-2,5e-2,1e-1,5e-1,1)
+best <- -Inf; prs <- NULL
+for (t in pthr) {
+  cols <- intersect(ind.clump, info$`_NUM_ID_`[info$p <= t]); if (!length(cols)) next
+  w <- info$beta[match(cols, info$`_NUM_ID_`)]
+  x <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols,
+                   center=rep(0, length(cols)), scale=rep(1, length(cols)))
+  r2 <- summary(lm(BMI ~ x + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+  if (r2 > best) { best <- r2; prs <- x }
+}
+D$PRS_CT <- as.numeric(prs)
+
+# ---------- LDpred2-auto + LDpred2-inf ----------
+beta_auto <- rep(0, ncol(G)); beta_inf <- rep(0, ncol(G)); cols_all <- integer(0)
+get_h2 <- function(corr, dfb){ y <- snp_ldsc2(corr, dfb); if (is.list(y) && !is.null(y$h2)) y$h2 else as.numeric(y)[1] }
+get_auto <- function(a, L){
+  if (is.list(a) && !is.null(a$beta_est)) return(a$beta_est)
+  if (is.list(a) && length(a) && !is.null(a[[1]]$beta_est)) return(rowMeans(do.call(cbind, lapply(a, `[[`, "beta_est")), na.rm=TRUE))
+  if (is.numeric(a) && length(a)==L) return(a)
+  rep(0, L)
+}
+for (c in sort(unique(info$chr))) {
+  rows <- which(info$chr==c); ord <- order(info$pos[rows]); rows <- rows[ord]
+  indc <- info$`_NUM_ID_`[rows]
+  dfb <- data.frame(beta=as.numeric(info$beta[rows]),
+                    beta_se=as.numeric(ifelse(is.na(info$beta_se[rows])|info$beta_se[rows]<=0,0.02,info$beta_se[rows])),
+                    n_eff=as.numeric(ifelse(is.na(info$n_eff[rows])|info$n_eff[rows]<=0,200000,info$n_eff[rows])))
+  corr <- bigsparser::as_SFBM(snp_cor(G, ind.row=ind.keep, ind.col=indc,
+                                      infos.pos=map$physical.pos[indc], size=3/1000))
+  h2 <- get_h2(corr, dfb)
+  a  <- snp_ldpred2_auto(corr, dfb, h2_init=h2)
+  beta_auto[indc] <- ifelse(is.na(get_auto(a, length(indc))), 0, get_auto(a, length(indc)))
+  beta_inf[indc]  <- ifelse(is.na(snp_ldpred2_inf(corr, dfb, h2)), 0, snp_ldpred2_inf(corr, dfb, h2))
+  cols_all <- c(cols_all, indc)
+}
+cols_all <- unique(cols_all)
+D$PRS_LDPA <- big_prodVec(G, beta_auto[cols_all], ind.row=ind.keep, ind.col=cols_all,
+                          center=rep(0, length(cols_all)), scale=rep(1, length(cols_all)))
+D$PRS_LDPI <- big_prodVec(G, beta_inf[cols_all],  ind.row=ind.keep, ind.col=cols_all,
+                          center=rep(0, length(cols_all)), scale=rep(1, length(cols_all)))
+
+
+
+# ==== Evaluation: R2, AUC, ORs (Haldane-corrected), by ancestry ====
+library(pROC)
+
+# standardize PRS
+D$PRS_CT_z   <- as.numeric(scale(D$PRS_CT))
+D$PRS_LDPA_z <- as.numeric(scale(D$PRS_LDPA))
+D$PRS_LDPI_z <- as.numeric(scale(D$PRS_LDPI))
+
+# ancestry + case
+samples <- fread(file.path(pth, "1kg_samples.txt"))
+setnames(samples, c("Sample name","Superpopulation code"), c("IID","SUPER"))
+D <- merge(D, samples[,.(IID,SUPER)], by="IID", all.x=TRUE)
+phfile <- if (file.exists(file.path(pth, "obesity_pheno.txt"))) "obesity_pheno.txt" else "Obesity_pheno.txt"
+ob <- fread(file.path(pth, phfile), col.names=c("FID","IID","case"))
+D <- merge(D, ob, by=c("FID","IID"), all.x=TRUE)
+
+# 80/20 split
+set.seed(7)
+n <- nrow(D); idx_tr <- sample.int(n, floor(0.8*n)); idx_te <- setdiff(seq_len(n), idx_tr)
+TR <- as.data.frame(D[idx_tr,]); TE <- as.data.frame(D[idx_te,])
+
+# base R2 on test
+r2_base_te <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=TE))$r.squared
+
+eval_one <- function(prs_name) {
+  m_tr <- lm(reformulate(c(prs_name, paste0("PC",1:10)), "BMI"), data=TR)
+  yhat <- predict(m_tr, newdata=TE)
+  r2f  <- 1 - sum((TE$BMI - yhat)^2) / sum((TE$BMI - mean(TE$BMI))^2)
+  dR2  <- r2f - r2_base_te
+
+  auc_val <- NA_real_
+  te_cc <- TE[!is.na(TE$case), ]
+  if (nrow(te_cc) > 20 && length(unique(te_cc$case))==2) {
+    g_tr <- glm(reformulate(c(prs_name, paste0("PC",1:10)), "case"),
+                data=TR[!is.na(TR$case),], family=binomial())
+    p_hat <- predict(g_tr, newdata=te_cc, type="response")
+    auc_val <- as.numeric(auc(roc(te_cc$case, p_hat)))
+  }
+  list(R2_full=r2f, dR2=dR2, AUC=auc_val)
+}
+
+res <- list(
+  `C+T`          = eval_one("PRS_CT_z"),
+  `LDpred2-auto` = eval_one("PRS_LDPA_z"),
+  `LDpred2-inf`  = eval_one("PRS_LDPI_z")
+)
+cat("\n== Test metrics (overall) ==\n")
+print(data.frame(
+  Method  = names(res),
+  R2_full = sapply(res, function(x) round(x$R2_full,4)),
+  dR2     = sapply(res, function(x) round(x$dR2,4)),
+  AUC     = sapply(res, function(x) round(x$AUC,4))
+), row.names=FALSE)
+
+# ---- ORs with Haldane 0.5 correction  ----
+te_cc <- TE[!is.na(TE$case), ]
+or_haldane <- function(a,b,c,d) {
+  a<-a+0.5; b<-b+0.5; c<-c+0.5; d<-d+0.5
+  or  <- (a*d)/(b*c)
+  se  <- sqrt(1/a + 1/b + 1/c + 1/d)
+  lcl <- exp(log(or) - 1.96*se)
+  ucl <- exp(log(or) + 1.96*se)
+  c(OR=or, LCL=lcl, UCL=ucl)
+}
+ors_from_percentiles <- function(scores, y) {
+  if (length(scores)==0 || all(is.na(y))) return(matrix(NA,3,3, dimnames=list(c("Top10_vs_Mid40","Bot10_vs_Mid40","Top10_vs_Bot10"), c("OR","LCL","UCL"))))
+  q <- quantile(scores, c(.1,.4,.6,.9), na.rm=TRUE)
+  grp <- cut(scores, breaks=c(-Inf,q[1],q[2],q[3],q[4],Inf),
+             labels=c("B10","P10_40","P40_60","P60_90","T10"), include.lowest=TRUE)
+  mid <- grp %in% c("P10_40","P40_60"); top <- grp=="T10"; bot <- grp=="B10"
+  cnt <- function(sel1, sel0) {
+    a <- sum(y[sel1]==1, na.rm=TRUE); b <- sum(y[sel0]==1, na.rm=TRUE)
+    c <- sum(y[sel1]==0, na.rm=TRUE); d <- sum(y[sel0]==0, na.rm=TRUE)
+    or_haldane(a,b,c,d)
+  }
+  rbind(Top10_vs_Mid40 = cnt(top, mid),
+        Bot10_vs_Mid40 = cnt(bot, mid),
+        Top10_vs_Bot10 = cnt(top, bot))
+}
+
+OR_CT   <- ors_from_percentiles(te_cc$PRS_CT_z,   te_cc$case)
+OR_AUTO <- ors_from_percentiles(te_cc$PRS_LDPA_z, te_cc$case)
+OR_INF  <- ors_from_percentiles(te_cc$PRS_LDPI_z, te_cc$case)
+
+cat("\n== Test ORs by PRS percentiles (Haldane corrected) ==\n")
+print(round(OR_CT,   3))
+print(round(OR_AUTO, 3))
+print(round(OR_INF,  3))
+
+# ---- by ancestry (same test split) ----
+eval_by_anc <- function(prs_name, anc) {
+  tr <- TR[TR$SUPER==anc,]; te <- TE[TE$SUPER==anc,]
+  if (nrow(te) < 30) return(c(R2_full=NA, dR2=NA, AUC=NA))
+  r2b <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=te))$r.squared
+  fit <- lm(reformulate(c(prs_name, paste0("PC",1:10)), "BMI"), data=tr)
+  pr  <- predict(fit, newdata=te)
+  r2f <- 1 - sum((te$BMI - pr)^2) / sum((te$BMI - mean(te$BMI))^2)
+  auc_val <- NA_real_
+  te_cc <- te[!is.na(te$case),]
+  if (nrow(te_cc) > 20 && length(unique(te_cc$case))==2) {
+    g <- glm(reformulate(c(prs_name, paste0("PC",1:10)), "case"),
+             data=tr[!is.na(tr$case),], family=binomial())
+    auc_val <- as.numeric(auc(roc(te_cc$case, predict(g, newdata=te_cc, type="response"))))
+  }
+  c(R2_full=r2f, dR2=r2f-r2b, AUC=auc_val)
+}
+ancs <- c("EUR","AFR","AMR","EAS","SAS")
+tab <- rbindlist(lapply(ancs, function(a) data.table(Ancestry=a, Method="C+T",          t(eval_by_anc("PRS_CT_z",   a)))))
+tab <- rbind(tab, rbindlist(lapply(ancs, function(a) data.table(Ancestry=a, Method="LDpred2-auto", t(eval_by_anc("PRS_LDPA_z", a))))))
+tab <- rbind(tab, rbindlist(lapply(ancs, function(a) data.table(Ancestry=a, Method="LDpred2-inf",  t(eval_by_anc("PRS_LDPI_z", a))))))
+cat("\n== Test metrics by ancestry ==\n"); print(tab)
+
+
+
+
+
+
+
+
+
+library(ggplot2)
+
+# ===== 1) C+T tuning curve (ΔR2 vs p-threshold) =====
+r2b_all <- summary(lm(BMI ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+r2_grid <- sapply(pthr, function(t) {
+  cols <- intersect(ind.clump, info$`_NUM_ID_`[info$p <= t]); cols <- cols[!is.na(cols)]
+  if (!length(cols)) return(NA_real_)
+  w <- info$beta[match(cols, info$`_NUM_ID_`)]
+  s <- big_prodVec(G, w, ind.row=ind.keep, ind.col=cols, center=rep(0, length(cols)), scale=rep(1, length(cols)))
+  r2f <- summary(lm(BMI ~ s + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=D))$r.squared
+  r2f - r2b_all
+})
+df_tune <- data.frame(pthr=pthr, dR2=r2_grid)
+ggplot(df_tune, aes(pthr, dR2)) +
+  geom_line() + geom_point() + scale_x_log10() +
+  labs(title="C+T tuning curve", x="p-threshold (log10)", y="ΔR² vs PCs") +
+  theme_bw()
+
+# ===== 2) Test-set ΔR2 bars (C+T, LDpred2-auto, LDpred2-inf) =====
+df_overall <- data.frame(
+  Method  = names(res),
+  R2_full = sapply(res, function(x) x$R2_full),
+  dR2     = sapply(res, function(x) x$dR2)
+)
+ggplot(df_overall, aes(Method, dR2, fill=Method)) +
+  geom_col(width=.6, show.legend=FALSE) +
+  geom_text(aes(label=sprintf("%.3f", dR2)), vjust=-.25) +
+  labs(title="Test ΔR² by method", y="ΔR² (vs PCs only)", x="") +
+  theme_bw()
+
+# ===== 3) BMI vs PRS (scatter + linear fit), all methods =====
+D$PRS_CT_z   <- as.numeric(scale(D$PRS_CT))
+D$PRS_LDPA_z <- as.numeric(scale(D$PRS_LDPA))
+D$PRS_LDPI_z <- as.numeric(scale(D$PRS_LDPI))
+df_sc <- rbind(
+  data.frame(Method="C+T",          PRS=D$PRS_CT_z,   BMI=D$BMI),
+  data.frame(Method="LDpred2-auto", PRS=D$PRS_LDPA_z, BMI=D$BMI),
+  data.frame(Method="LDpred2-inf",  PRS=D$PRS_LDPI_z, BMI=D$BMI)
+)
+ggplot(df_sc, aes(PRS, BMI)) +
+  geom_point(alpha=.3, size=1) +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~Method) +
+  labs(title="BMI vs standardized PRS", x="PRS z-score", y="BMI") +
+  theme_bw()
+
+# ===== 4) Case prevalence by PRS decile  =====
+te_cc <- TE[!is.na(TE$case), ]
+if (nrow(te_cc) > 20 && length(unique(te_cc$case))==2) {
+  prev_dec <- function(vec, name) {
+    q  <- quantile(vec, probs=seq(0,1,.1), na.rm=TRUE)
+    d  <- cut(vec, q, include.lowest=TRUE, labels=paste0("D",1:10))
+    dt <- data.table(Decile=d, case=te_cc$case)[, .(n=.N, p=mean(case==1)), by=Decile]
+    dt$Method <- name; dt
+  }
+  prev_all <- rbind(
+    prev_dec(te_cc$PRS_CT_z,   "C+T"),
+    prev_dec(te_cc$PRS_LDPA_z, "LDpred2-auto"),
+    prev_dec(te_cc$PRS_LDPI_z, "LDpred2-inf")
+  )
+  ggplot(prev_all, aes(Decile, p, group=Method, color=Method)) +
+    geom_point() + geom_line() +
+    labs(title="Case prevalence across PRS deciles (test)", y="Prevalence", x="PRS decile") +
+    theme_bw() + theme(axis.text.x=element_text(angle=45,hjust=1))
+}
+
+# ===== 5) ROC curves (test set; fit on TRAIN) =====
+if (nrow(te_cc) > 20 && length(unique(te_cc$case))==2) {
+  pred_prob <- function(prs_name) {
+    g <- glm(reformulate(c(prs_name, paste0("PC",1:10)), "case"),
+             data=TR[!is.na(TR$case),], family=binomial())
+    predict(g, newdata=te_cc, type="response")
+  }
+  roc_df <- function(p, y) {
+    r <- pROC::roc(y, p, quiet=TRUE)
+    cd <- as.data.frame(pROC::coords(r, "all", ret=c("specificity","sensitivity")))
+    data.frame(FPR=1-cd$specificity, TPR=cd$sensitivity, AUC=as.numeric(pROC::auc(r)))
+  }
+  R <- rbind(
+    cbind(Method="C+T",          roc_df(pred_prob("PRS_CT_z"),   te_cc$case)),
+    cbind(Method="LDpred2-auto", roc_df(pred_prob("PRS_LDPA_z"), te_cc$case)),
+    cbind(Method="LDpred2-inf",  roc_df(pred_prob("PRS_LDPI_z"), te_cc$case))
+  )
+  auc_lab <- aggregate(AUC ~ Method, R, mean)
+  ggplot(R, aes(FPR, TPR, color=Method)) +
+    geom_path(size=1) + geom_abline(slope=1, intercept=0, linetype=2) +
+    labs(title=paste0("ROC (test) — AUC: ",
+                      paste(auc_lab$Method, sprintf("%.3f", auc_lab$AUC), collapse=" | ")),
+         x="False Positive Rate", y="True Positive Rate") +
+    theme_bw()
+}
+
+
+
+
